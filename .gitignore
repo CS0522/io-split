@@ -1,0 +1,4 @@
+spdk_nvme_perf
+*.d
+*.o
+*.md
