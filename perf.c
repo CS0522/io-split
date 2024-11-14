@@ -1642,14 +1642,26 @@ task_complete(struct perf_task *task)
 	 * submitted I/O to complete. In this case, do not submit a new I/O to
 	 * replace the one just completed.
 	 */
-    // 或者在按照 IO 大小分流时
+    // 在按照 IO 大小分流时
     // 当 4K 或 256K 其中一个发完后，就不发该类型的了
-    // 4K: counter_index = 0; 256K: counter_index = 1 
-    int counter_index = task->task_io_size_bytes / g_io_size_bytes_threshold;
-    int p = counter_index ? 100 - g_io_size_4k_percentage : g_io_size_4k_percentage;
-	if (spdk_unlikely(ns_ctx->is_draining) ||
-        (g_split_io_strategy &&
-        (ns_ctx->io_size_submitted_counter[counter_index] >= g_number_ios * (p / 100.0)))) {
+    if (g_split_io_strategy)
+    {
+        // 4K: counter_index = 0; 256K: counter_index = 1
+        int counter_index = task->task_io_size_bytes / g_io_size_bytes_threshold;
+        int p = counter_index ? 100 - g_io_size_4k_percentage : g_io_size_4k_percentage;
+
+        if (ns_ctx->io_size_submitted_counter[counter_index] >= g_number_ios * (p / 100.0))
+        {
+            spdk_dma_free(task->iovs[0].iov_base);
+		    free(task->iovs);
+		    spdk_dma_free(task->md_iov.iov_base);
+		    free(task);
+
+            return;
+        }
+    }
+
+	if (spdk_unlikely(ns_ctx->is_draining)) {
 		spdk_dma_free(task->iovs[0].iov_base);
 		free(task->iovs);
 		spdk_dma_free(task->md_iov.iov_base);
@@ -1706,8 +1718,7 @@ allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
         if (queue_depth >= g_queue_depth * (g_io_size_4k_percentage / 100.0))
             // 256K
             task->task_io_size_bytes = g_io_size_bytes * 64;
-    }
-    // 这样造成的结果就是初始时先下完 256K，然后再开始下 4K
+    } // 这样造成的结果就是初始时先下完 256K，然后再开始下 4K
 
 	ns_ctx->entry->fn_table->setup_payload(task, queue_depth % 8 + 1);
 
@@ -3463,7 +3474,6 @@ main(int argc, char **argv)
 			    spdk_env_thread_launch_pinned(worker->lcore, work_fn_rtc, worker);
             else
                 spdk_env_thread_launch_pinned(worker->lcore, work_fn, worker);
-            spdk_env_thread_launch_pinned(worker->lcore, work_fn, worker);
 		} else {
 			assert(main_worker == NULL);
 			main_worker = worker;
