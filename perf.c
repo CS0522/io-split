@@ -160,7 +160,7 @@ struct ns_worker_ctx {
 	bool			is_draining;
 
     // init_ns_worker_ctx() 时绑定
-    struct splitter *io_splitter;
+    const struct splitter *io_splitter;
 
     // 添加 IO 大小的发送 IO 个数计数器
     // [0]: 记录 4K
@@ -870,7 +870,7 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
     // 如果策略为 IO 大小分流，则利用 task_io_size_bytes
     if (g_split_io_strategy)
         curr_io_size_bytes = task->task_io_size_bytes;
-	max_io_size_bytes = curr_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
+    max_io_size_bytes = curr_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
 	buf = spdk_dma_zmalloc(max_io_size_bytes, g_io_align, NULL);
 	if (buf == NULL) {
 		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
@@ -1984,7 +1984,7 @@ work_fn(void *arg)
 static int
 work_fn_rtc(void *arg)
 {
-
+    return 0;
 }
 
 static void
@@ -2674,6 +2674,7 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
                 break;
             case PERF_IO_SIZE_MIX4K:
                 g_io_size_4k_percentage = val;
+                break;
 			case PERF_WARMUP_TIME:
 				g_warmup_time_in_sec = val;
 				break;
@@ -3485,8 +3486,8 @@ main(int argc, char **argv)
 	    work_fn_rtc(main_worker);
     else
         work_fn(main_worker);
-
-	spdk_env_thread_wait_all();
+    
+    spdk_env_thread_wait_all();
 
 	print_stats();
 
