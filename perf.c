@@ -265,7 +265,7 @@ static int g_nr_unused_io_queues = 0;
 // 读写分流: 0，大小分流: 1
 static int g_split_io_strategy = 0;
 // 设定大小分流的阈值
-static int g_io_size_bytes_threshold;
+static uint32_t g_io_size_bytes_threshold;
 // 设定 io 模型为 epoll 或 rtc
 static const char *g_io_model;
 // 设定 io size 中 4K 的比例
@@ -926,6 +926,12 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
     // 根据分流的逻辑获得对应的 qp
 	qp_num = ns_ctx->io_splitter->split_io(task);
 
+    // myprint
+    // if (g_split_io_strategy)
+    //     printf("qp_num = %d, task->task_io_size_bytes = %d\n", qp_num, task->task_io_size_bytes);
+    // else
+    //     printf("qp_num = %d, task->is_read = %d\n", qp_num, task->is_read);
+
 	if (mode != DIF_MODE_NONE) {
 		dif_opts.size = SPDK_SIZEOF(&dif_opts, dif_pi_format);
 		dif_opts.dif_pi_format = SPDK_DIF_PI_FORMAT_16;
@@ -1056,7 +1062,7 @@ static int worker_split_io(const struct perf_task *task)
         return 0;
     // 对 io 大小分流
     if (g_split_io_strategy)
-        return (task->task_io_size_bytes / g_io_size_bytes_threshold);
+        return (task->task_io_size_bytes > g_io_size_bytes_threshold);
     // 对 io 读写分流
     else
         return (task->is_read);
@@ -1600,7 +1606,7 @@ submit_single_io(struct perf_task *task)
 
         // 4K 或 256K 计数
         if (g_split_io_strategy)
-            ns_ctx->io_size_submitted_counter[task->task_io_size_bytes / g_io_size_bytes_threshold]++;
+            ns_ctx->io_size_submitted_counter[task->task_io_size_bytes > g_io_size_bytes_threshold]++;
 	}
 
 	if (spdk_unlikely(g_number_ios && ns_ctx->stats.io_submitted >= g_number_ios)) {
@@ -1647,7 +1653,7 @@ task_complete(struct perf_task *task)
     if (g_split_io_strategy)
     {
         // 4K: counter_index = 0; 256K: counter_index = 1
-        int counter_index = task->task_io_size_bytes / g_io_size_bytes_threshold;
+        int counter_index = task->task_io_size_bytes > g_io_size_bytes_threshold;
         int p = counter_index ? 100 - g_io_size_4k_percentage : g_io_size_4k_percentage;
 
         if (ns_ctx->io_size_submitted_counter[counter_index] >= g_number_ios * (p / 100.0))
@@ -2024,6 +2030,7 @@ usage(char *program_name)
     printf("\t-u, --split-io-strategy <val> 0 for split io by read/write, 1 for split io by size. default: 0\n");
     printf("\t-v, --io-size-threshold <val> io size threshold in bytes for split io by size\n");
     printf("\t-x, --io-model <val> 'epoll' or 'rtc'\n");
+    printf("\t-y, --io-size-mix4k <0-100> mix 4k percentage\n");
     printf("\n");
 
 	printf("==== ADVANCED OPTIONS ====\n\n");
