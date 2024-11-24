@@ -961,9 +961,14 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 	    }
     }
 
-    // myprint 
+    // myprint
     printf("g_split_io_strategy = %d\n", g_split_io_strategy);
     printf("qp_num = %d, task->is_read = %d, task->task_io_size_bytes = %u, task->iovs[0].iov_len = %ld\n", qp_num, task->is_read, task->task_io_size_bytes, task->iovs[0].iov_len);
+
+    // 修改一个 IO 里的块个数
+    uint32_t io_size_blocks = entry->io_size_blocks;
+    if (task->task_io_size_bytes == g_io_size_bytes * 64)
+        io_size_blocks *= 64;
 
 	if (mode != DIF_MODE_NONE) {
 		dif_opts.size = SPDK_SIZEOF(&dif_opts, dif_pi_format);
@@ -983,12 +988,12 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			return spdk_nvme_ns_cmd_read_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
 							     task->iovs[0].iov_base, task->md_iov.iov_base,
 							     lba,
-							     entry->io_size_blocks, io_complete,
+							     io_size_blocks, io_complete,
 							     task, entry->io_flags,
 							     task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
 		} else {
 			return spdk_nvme_ns_cmd_readv_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
-							      lba, entry->io_size_blocks,
+							      lba, io_size_blocks,
 							      io_complete, task, entry->io_flags,
 							      nvme_perf_reset_sgl, nvme_perf_next_sge,
 							      task->md_iov.iov_base,
@@ -1019,12 +1024,12 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			return spdk_nvme_ns_cmd_write_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
 							      task->iovs[0].iov_base, task->md_iov.iov_base,
 							      lba,
-							      entry->io_size_blocks, io_complete,
+							      io_size_blocks, io_complete,
 							      task, entry->io_flags,
 							      task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
 		} else {
 			return spdk_nvme_ns_cmd_writev_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
-							       lba, entry->io_size_blocks,
+							       lba, io_size_blocks,
 							       io_complete, task, entry->io_flags,
 							       nvme_perf_reset_sgl, nvme_perf_next_sge,
 							       task->md_iov.iov_base,
@@ -1801,6 +1806,27 @@ submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 {
 	struct perf_task *task;
 
+    /* 如果 mix 为 0% 的情况 */
+    if (g_io_size_4k_percentage == 0 || g_io_size_4k_percentage == 100 ||
+        g_rw_percentage == 0 || g_rw_percentage == 100)
+    {
+        if (g_split_io_strategy)
+            // 4K 比例为 0，io_submit_flag = 1，全发 256K
+            // 4K 比例为 100，io_submit_flag = 0，全发 4K
+            ns_ctx->io_submit_flag = (g_io_size_4k_percentage == 0);
+        else
+            // r 比例为 0，io_submit_flag = 0，全发 write
+            // r 比例为 100，io_submit_flag = 1，全发 read
+            ns_ctx->io_submit_flag = (g_rw_percentage == 100);
+        while (queue_depth > 0)
+        {
+            task = ns_ctx->allocated_tasks[ns_ctx->io_submit_flag][g_queue_depth - queue_depth];
+            submit_single_io(task);
+            --queue_depth;
+        }
+        return;
+    }
+
     while (queue_depth > 0)
     {
         // 交叉下 task
@@ -2332,6 +2358,15 @@ print_performance(void)
 						                g_tsc_rate;
                 g_io_avg_latency[1] = ((double)ns_ctx->io_total_tsc[1] / ns_ctx->io_submitted_counter[1]) * 1000 * 1000 /
 						                g_tsc_rate;
+
+                // myprint
+                printf("ns_ctx->stats.io_submitted: %lu\n", ns_ctx->stats.io_submitted);
+                printf("ns_ctx->stats.io_completed: %lu\n", ns_ctx->stats.io_completed);
+                printf("ns_ctx->stats.total_tsc: %lu\n", ns_ctx->stats.total_tsc);
+                printf("ns_ctx->io_submitted_counter: %u, %u\n", ns_ctx->io_submitted_counter[0], ns_ctx->io_submitted_counter[1]);
+                printf("ns_ctx->io_total_tsc: %lu, %lu\n", ns_ctx->io_total_tsc[0], ns_ctx->io_total_tsc[1]);
+                printf("g_tsc_rate: %lu\n", g_tsc_rate);
+                printf("g_io_avg_latency: %f, %f\n", g_io_avg_latency[0], g_io_avg_latency[1]);
 
 				min_latency = (double)ns_ctx->stats.min_tsc * 1000 * 1000 / g_tsc_rate;
 				if (min_latency < min_latency_so_far) {

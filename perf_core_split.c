@@ -1804,20 +1804,7 @@ task_complete(struct perf_task *task)
              * 最后一个 4k 发完，在这次回调中一次发送 n 个 256K，
              * 后续 4K 完成回调不再发送
              */
-            // TODO 重新发送 256K
-            if (!ns_ctx->has_submitted_the_other_type)
-            {
-                // 打上发送过另一个 IO 类型标记
-                ns_ctx->has_submitted_the_other_type = 1;
-
-                // 检查另一种类型的 IO 是否发送完毕
-                if (__sync_add_and_fetch(&g_io_submitted_counter[!counter_index], 0) < g_io_max_submit_num[!counter_index])
-                {
-                    // 一次发送 n 个指定另一种类型 IO
-                    submit_io_specific_type(ns_ctx, g_queue_depth, !counter_index);
-                    // 发送完 return
-                }
-            }
+            // TODO 是否需要发送另一个类型 IO？
             return;
         }
     }
@@ -1910,6 +1897,7 @@ submit_io_specific_type(struct ns_worker_ctx *ns_ctx, int submit_num, int io_typ
 static void
 submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 {
+    // TODO mix 为 0% 的情况
     /**
      * 开启分流，单个 worker 首先只下某种类型的 IO
      */
