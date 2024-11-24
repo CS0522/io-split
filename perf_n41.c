@@ -26,6 +26,9 @@
 #include "spdk/zipf.h"
 #include "spdk/nvmf.h"
 
+#include <time.h>
+#include <sys/time.h>
+
 #ifdef SPDK_CONFIG_URING
 #include <liburing.h>
 #endif
@@ -124,6 +127,34 @@ struct ns_worker_stats {
 	uint64_t		last_idle_tsc;
 };
 
+struct perf_task {
+	struct ns_worker_ctx	*ns_ctx;
+	struct iovec		*iovs; /* array of iovecs to transfer. */
+	int			iovcnt; /* Number of iovecs in iovs array. */
+	int			iovpos; /* Current iovec position. */
+	uint32_t		iov_offset; /* Offset in current iovec. */
+	struct iovec		md_iov;
+	uint64_t		submit_tsc;
+	bool			is_read;
+    // 添加一个字段记录 io 大小应当是多少
+    // 仅当分流策略为大小分流时才用
+    uint32_t    task_io_size_bytes;
+	struct spdk_dif_ctx	dif_ctx;
+#if HAVE_LIBAIO
+	struct iocb		iocb;
+#endif
+	TAILQ_ENTRY(perf_task)	link;
+};
+
+// 在这里添加一个 splitter 对 io 分流
+struct splitter {
+    /** return qp_num
+    *      读写分流: read_io: 1, write_io: 0
+    *      大小分流: big_io: 1, small_io: 0
+    */
+    int (*split_io)(const struct perf_task *task);
+};
+
 struct ns_worker_ctx {
 	struct ns_entry		*entry;
 	struct ns_worker_stats	stats;
@@ -131,8 +162,22 @@ struct ns_worker_ctx {
 	uint64_t		offset_in_ios;
 	bool			is_draining;
 
+    // init_ns_worker_ctx() 时绑定
+    const struct splitter *io_splitter;
+
+    // 发送 IO 个数计数器
+    // [0]: 记录 4K
+    // [1]: 记录 256K
+    uint32_t io_submitted_counter[2];
+
+    // 记录 worker_id
+    uint32_t worker_id;
+
 	union {
 		struct {
+            // 每个 ns_worker_ctx 共 2 个 qp，进行分流
+            // read_io qp: 1, write_io qp: 0
+            // big_io qp: 1, small_io qp: 0
 			int				num_active_qpairs;
 			int				num_all_qpairs;
 			struct spdk_nvme_qpair		**qpair;
@@ -165,26 +210,13 @@ struct ns_worker_ctx {
 	int				status;
 };
 
-struct perf_task {
-	struct ns_worker_ctx	*ns_ctx;
-	struct iovec		*iovs; /* array of iovecs to transfer. */
-	int			iovcnt; /* Number of iovecs in iovs array. */
-	int			iovpos; /* Current iovec position. */
-	uint32_t		iov_offset; /* Offset in current iovec. */
-	struct iovec		md_iov;
-	uint64_t		submit_tsc;
-	bool			is_read;
-	struct spdk_dif_ctx	dif_ctx;
-#if HAVE_LIBAIO
-	struct iocb		iocb;
-#endif
-	TAILQ_ENTRY(perf_task)	link;
-};
-
 struct worker_thread {
 	TAILQ_HEAD(, ns_worker_ctx)	ns_ctx;
 	TAILQ_ENTRY(worker_thread)	link;
 	unsigned			lcore;
+
+    // 记录 worker_id
+    uint32_t worker_id;
 };
 
 struct ns_fn_table {
@@ -235,8 +267,23 @@ static uint32_t g_metacfg_prchk_flags;
 static int g_rw_percentage = -1;
 static int g_is_random;
 static uint32_t g_queue_depth;
+// 核分流
+// ns_ctx qp 固定为 1
+// 每个核控制一个 qp
 static int g_nr_io_queues_per_ns = 1;
-static int g_nr_unused_io_queues;
+static int g_nr_unused_io_queues = 0;
+// 标记分流策略
+// 读写分流: 0，大小分流: 1
+static int g_split_io_strategy = 0;
+// 关闭分流: 0，开启分流: 1
+static int g_enable_split_io = 1;
+// 设定大小分流的阈值
+static uint32_t g_io_size_bytes_threshold;
+// 设定 io size 中 4K 的比例
+static int g_io_size_4k_percentage = -1;
+// 开始、结束时间
+static struct timespec start_time;
+static struct timespec end_time;
 static int g_time_in_sec;
 static uint64_t g_number_ios;
 static uint64_t g_elapsed_time_in_usec;
@@ -422,7 +469,7 @@ nvme_perf_allocate_iovs(struct perf_task *task, void *buf, uint32_t length)
 	int iovpos = 0;
 	struct iovec *iov;
 	uint32_t offset = 0;
-
+    // iovcnt = 1
 	task->iovcnt = SPDK_CEIL_DIV(length, (uint64_t)g_io_unit_size);
 	task->iovs = calloc(task->iovcnt, sizeof(struct iovec));
 	if (!task->iovs) {
@@ -431,6 +478,7 @@ nvme_perf_allocate_iovs(struct perf_task *task, void *buf, uint32_t length)
 
 	while (length > 0) {
 		iov = &task->iovs[iovpos];
+        // iov_len = length
 		iov->iov_len = spdk_min(length, g_io_unit_size);
 		iov->iov_base = buf + offset;
 		length -= iov->iov_len;
@@ -832,7 +880,11 @@ nvme_setup_payload(struct perf_task *task, uint8_t pattern)
 	/* maximum extended lba format size from all active namespace,
 	 * it's same with g_io_size_bytes for namespace without metadata.
 	 */
-	max_io_size_bytes = g_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
+    uint32_t curr_io_size_bytes = g_io_size_bytes;
+    // 如果策略为 IO 大小分流，则利用 task_io_size_bytes
+    if (g_split_io_strategy)
+        curr_io_size_bytes = task->task_io_size_bytes;
+    max_io_size_bytes = curr_io_size_bytes + g_max_io_md_size * g_max_io_size_blocks;
 	buf = spdk_dma_zmalloc(max_io_size_bytes, g_io_align, NULL);
 	if (buf == NULL) {
 		fprintf(stderr, "task->buf spdk_dma_zmalloc failed\n");
@@ -885,11 +937,25 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 		}
 	}
 
-	qp_num = ns_ctx->u.nvme.last_qpair;
-	ns_ctx->u.nvme.last_qpair++;
-	if (ns_ctx->u.nvme.last_qpair == ns_ctx->u.nvme.num_active_qpairs) {
-		ns_ctx->u.nvme.last_qpair = 0;
-	}
+    // 根据分流的逻辑获得对应的 qp
+    // 开启分流
+    if (g_enable_split_io)
+	    qp_num = ns_ctx->io_splitter->split_io(task);
+    // 关闭分流
+    else
+    {
+        qp_num = ns_ctx->u.nvme.last_qpair;
+	    ns_ctx->u.nvme.last_qpair++;
+	    if (ns_ctx->u.nvme.last_qpair == ns_ctx->u.nvme.num_active_qpairs) {
+	    	ns_ctx->u.nvme.last_qpair = 0;
+	    }
+    }
+
+    // myprint
+    // if (g_split_io_strategy)
+    //     printf("qp_num = %d, task->task_io_size_bytes = %d\n", qp_num, task->task_io_size_bytes);
+    // else
+    //     printf("qp_num = %d, task->is_read = %d\n", qp_num, task->is_read);
 
 	if (mode != DIF_MODE_NONE) {
 		dif_opts.size = SPDK_SIZEOF(&dif_opts, dif_pi_format);
@@ -1010,6 +1076,29 @@ nvme_verify_io(struct perf_task *task, struct ns_entry *entry)
 	}
 }
 
+// worker_ctx 中 splitter 对 io 分流的函数
+/** return qp_num
+*      读写分流: read_io: 1, write_io: 0
+*      大小分流: big_io: 1, small_io: 0
+*/
+static int worker_split_io(const struct perf_task *task)
+{
+    if (!task)
+        return 0;
+    // 对 io 大小分流
+    if (g_split_io_strategy)
+        return (task->task_io_size_bytes > g_io_size_bytes_threshold);
+    // 对 io 读写分流
+    else
+        return (task->is_read);
+}
+
+// 创建一个 worker_splitter
+static const struct splitter worker_splitter = 
+{
+    .split_io = worker_split_io
+};
+
 /*
  * TODO: If a controller has multiple namespaces, they could all use the same queue.
  *  For now, give each namespace/thread combination its own queue.
@@ -1025,6 +1114,8 @@ nvme_init_ns_worker_ctx(struct ns_worker_ctx *ns_ctx)
 	uint64_t poll_timeout_tsc;
 	int i, rc;
 
+    /** 分流相关字段放在 init_ns_worker_ctx_ext() 函数中 */
+ 
 	ns_ctx->u.nvme.num_active_qpairs = g_nr_io_queues_per_ns;
 	ns_ctx->u.nvme.num_all_qpairs = g_nr_io_queues_per_ns + g_nr_unused_io_queues;
 	ns_ctx->u.nvme.qpair = calloc(ns_ctx->u.nvme.num_all_qpairs, sizeof(struct spdk_nvme_qpair *));
@@ -1327,7 +1418,8 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->u.nvme.ns = ns;
 	entry->num_io_requests = entries * spdk_divide_round_up(g_queue_depth, g_nr_io_queues_per_ns);
 
-	entry->size_in_ios = ns_size / g_io_size_bytes;
+    // 空间缩小为 10%
+	entry->size_in_ios = (ns_size / 10) / g_io_size_bytes;
 	entry->io_size_blocks = g_io_size_bytes / sector_size;
 
 	if (g_is_random) {
@@ -1532,6 +1624,10 @@ submit_single_io(struct perf_task *task)
 	} else {
 		ns_ctx->current_queue_depth++;
 		ns_ctx->stats.io_submitted++;
+
+        // 4K 或 256K 计数
+        if (g_split_io_strategy)
+            ns_ctx->io_submitted_counter[task->task_io_size_bytes > g_io_size_bytes_threshold]++;
 	}
 
 	if (spdk_unlikely(g_number_ios && ns_ctx->stats.io_submitted >= g_number_ios)) {
@@ -1573,6 +1669,25 @@ task_complete(struct perf_task *task)
 	 * submitted I/O to complete. In this case, do not submit a new I/O to
 	 * replace the one just completed.
 	 */
+    // 在按照 IO 大小分流时
+    // 当 4K 或 256K 其中一个发完后，就不发该类型的了
+    if (g_split_io_strategy)
+    {
+        // 4K: counter_index = 0; 256K: counter_index = 1
+        int counter_index = task->task_io_size_bytes > g_io_size_bytes_threshold;
+        int p = counter_index ? 100 - g_io_size_4k_percentage : g_io_size_4k_percentage;
+
+        if (ns_ctx->io_submitted_counter[counter_index] >= g_number_ios * (p / 100.0))
+        {
+            spdk_dma_free(task->iovs[0].iov_base);
+		    free(task->iovs);
+		    spdk_dma_free(task->md_iov.iov_base);
+		    free(task);
+
+            return;
+        }
+    }
+
 	if (spdk_unlikely(ns_ctx->is_draining)) {
 		spdk_dma_free(task->iovs[0].iov_base);
 		free(task->iovs);
@@ -1621,9 +1736,19 @@ allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
 		exit(1);
 	}
 
-	ns_ctx->entry->fn_table->setup_payload(task, queue_depth % 8 + 1);
+    task->ns_ctx = ns_ctx;
+    // IO 大小分流时指定 task 的 io 大小应当是多少
+    // 4K
+    task->task_io_size_bytes = g_io_size_bytes;
+    if (g_split_io_strategy)
+    {
+        int num = g_queue_depth * (g_io_size_4k_percentage / 100.0);
+        if (queue_depth >= ((num > 1) ? num : 1))
+            // 256K
+            task->task_io_size_bytes = g_io_size_bytes * 64;
+    } // 这样造成的结果就是初始时先下完 256K，然后再开始下 4K
 
-	task->ns_ctx = ns_ctx;
+	ns_ctx->entry->fn_table->setup_payload(task, queue_depth % 8 + 1);
 
 	return task;
 }
@@ -1720,6 +1845,22 @@ perf_dump_transport_statistics(struct worker_thread *worker)
 	}
 }
 
+/**
+ * 初始化 ns_ctx 分流相关字段
+ */
+static int 
+init_ns_worker_ctx_ext(struct ns_worker_ctx *ns_ctx)
+{
+    // 绑定 splitter
+    ns_ctx->io_splitter = &worker_splitter;
+
+    // 初始化 IO 大小发送计数器
+    ns_ctx->io_submitted_counter[0] = 0;
+    ns_ctx->io_submitted_counter[1] = 0;
+
+    return 0;
+}
+
 static int
 work_fn(void *arg)
 {
@@ -1743,6 +1884,7 @@ work_fn(void *arg)
 			ns_ctx->status = 1;
 			return 1;
 		}
+        init_ns_worker_ctx_ext(ns_ctx);
 	}
 
 	rc = pthread_barrier_wait(&g_worker_sync_barrier);
@@ -1762,6 +1904,9 @@ work_fn(void *arg)
 	} else {
 		tsc_end = tsc_current + g_time_in_sec * g_tsc_rate;
 	}
+
+    // 开始时计时
+    clock_gettime(CLOCK_REALTIME, &start_time);
 
 	/* Submit initial I/O for each namespace. */
 	TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
@@ -1809,10 +1954,14 @@ work_fn(void *arg)
 		}
 
 		if (spdk_unlikely(all_draining)) {
+            // 结束计时
+            clock_gettime(CLOCK_REALTIME, &end_time);
 			break;
 		}
 
 		tsc_current = spdk_get_ticks();
+        // 打点计时，最后一次打点就是结束时间
+        clock_gettime(CLOCK_REALTIME, &end_time);
 
 		if (worker->lcore == g_main_core && tsc_current > tsc_next_print) {
 			tsc_next_print += g_tsc_rate;
@@ -1824,6 +1973,8 @@ work_fn(void *arg)
 				/* Update test start and end time, clear statistics */
 				tsc_start = spdk_get_ticks();
 				tsc_end = tsc_start + g_time_in_sec * g_tsc_rate;
+                // 之前都是 warmup，所以 start_time 重置
+                clock_gettime(CLOCK_REALTIME, &start_time);
 
 				TAILQ_FOREACH(ns_ctx, &worker->ns_ctx, link) {
 					memset(&ns_ctx->stats, 0, sizeof(ns_ctx->stats));
@@ -1914,6 +2065,13 @@ usage(char *program_name)
 	printf("\t\t          -r 'trtype:RDMA adrfam:IPv4 traddr:192.168.100.8 trsvcid:4420' for NVMeoF\n");
 	printf("\t\t Note: can be specified multiple times to test multiple disks/targets.\n");
 	printf("\n");
+
+    printf("==== CUSTOM OPTIONS ====\n\n");
+    printf("\t-u, --split-io-strategy <val> 0 for split io by read/write, 1 for split io by size. default: 0\n");
+    printf("\t-v, --io-size-threshold <val> io size threshold in bytes for split io by size\n");
+    printf("\t-x, --io-model <val> 'epoll' or 'rtc'\n");
+    printf("\t-y, --io-size-mix4k <0-100> mix 4k percentage\n");
+    printf("\n");
 
 	printf("==== ADVANCED OPTIONS ====\n\n");
 	printf("\t--use-every-core for each namespace, I/Os are submitted from all cores\n");
@@ -2401,7 +2559,10 @@ parse_metadata(const char *metacfg_str)
 	return 0;
 }
 
-#define PERF_GETOPT_SHORT "a:b:c:d:e:ghi:lmo:q:r:k:s:t:w:z:A:C:DF:GHILM:NO:P:Q:RS:T:U:VZ:"
+// 添加设置分流策略 u、设置 io 大小阈值的参数 v
+// 添加设置 epoll、rtc 模型 x
+// 添加设置按大小分流时的混合比例 y
+#define PERF_GETOPT_SHORT "a:b:c:d:e:ghi:lmo:q:r:k:s:t:w:z:A:C:DF:GHILM:NO:P:Q:RS:T:U:VZ:u:v:y:Y:"
 
 static const struct option g_perf_cmdline_opts[] = {
 #define PERF_WARMUP_TIME	'a'
@@ -2506,6 +2667,18 @@ static const struct option g_perf_cmdline_opts[] = {
 	{"use-every-core", no_argument, NULL, PERF_USE_EVERY_CORE},
 #define PERF_NO_HUGE		270
 	{"no-huge", no_argument, NULL, PERF_NO_HUGE},
+    // 分流策略
+#define PERF_SPLIT_IO_STRATEGY  'u'
+	{"split-io-strategy", required_argument, NULL, PERF_SPLIT_IO_STRATEGY},
+    // io 大小阈值
+#define PERF_IO_SIZE_THRESHOLD  'v'
+	{"io-size-threshold", required_argument, NULL, PERF_IO_SIZE_THRESHOLD},
+    // io 大小混合比例
+#define PERF_IO_SIZE_MIX4K  'y'
+    {"io-size-mix4k", required_argument, NULL, PERF_IO_SIZE_MIX4K},
+    // 开启或关闭分流
+#define PERF_ENABLE_SPLIT_IO    'Y'
+    {"enable-split-io", required_argument, NULL, PERF_ENABLE_SPLIT_IO},
 	/* Should be the last element */
 	{0, 0, 0, 0}
 };
@@ -2535,12 +2708,24 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_CONTINUE_ON_ERROR:
 		case PERF_IO_QUEUE_SIZE:
 		case PERF_RDMA_SRQ_SIZE:
+        case PERF_SPLIT_IO_STRATEGY:
+        case PERF_IO_SIZE_MIX4K:
+        case PERF_ENABLE_SPLIT_IO:
 			val = spdk_strtol(optarg, 10);
 			if (val < 0) {
 				fprintf(stderr, "Converting a string to integer failed\n");
 				return val;
 			}
 			switch (op) {
+            case PERF_SPLIT_IO_STRATEGY:
+                g_split_io_strategy = val;
+                break;
+            case PERF_IO_SIZE_MIX4K:
+                g_io_size_4k_percentage = val;
+                break;
+            case PERF_ENABLE_SPLIT_IO:
+                g_enable_split_io = val;
+                break;
 			case PERF_WARMUP_TIME:
 				g_warmup_time_in_sec = val;
 				break;
@@ -2587,12 +2772,16 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		case PERF_BUFFER_ALIGNMENT:
 		case PERF_HUGEMEM_SIZE:
 		case PERF_NUMBER_IOS:
+        case PERF_IO_SIZE_THRESHOLD:
 			rc = spdk_parse_capacity(optarg, &val_u64, NULL);
 			if (rc != 0) {
 				fprintf(stderr, "Converting a string to integer failed\n");
 				return 1;
 			}
 			switch (op) {
+            case PERF_IO_SIZE_THRESHOLD:
+                g_io_size_bytes_threshold = (uint32_t)val_u64;
+                break;
 			case PERF_IO_SIZE:
 				g_io_size_bytes = (uint32_t)val_u64;
 				break;
@@ -2800,6 +2989,27 @@ parse_args(int argc, char **argv, struct spdk_env_opts *env_opts)
 		fprintf(stderr, "io unit size can not be 0 or non 4-byte aligned\n");
 		return 1;
 	}
+    if (g_enable_split_io != 0 && g_enable_split_io != 1)
+    {
+        fprintf(stderr, "invalid -Y (--enable-split-io) operand\n");
+		usage(argv[0]);
+		return 1;
+    }
+    if (g_split_io_strategy != 0 && g_split_io_strategy != 1) {
+        fprintf(stderr, "invalid -u (--split-io-strategy) operand\n");
+		usage(argv[0]);
+		return 1;
+    }
+    // 在 IO 大小分流的情况下检查 g_io_size_4k_percentage
+    if (g_enable_split_io && g_split_io_strategy)
+    {
+        if (g_io_size_4k_percentage < 0 || g_io_size_4k_percentage > 100) {
+			fprintf(stderr,
+				"-y (--io-size-mix4k) must be specified to value from 0 to 100 "
+				"for split io by size.\n");
+			return 1;
+		}
+    }
 	if (!g_workload_type) {
 		fprintf(stderr, "missing -w (--io-pattern) operand\n");
 		usage(argv[0]);
@@ -2917,6 +3127,8 @@ register_workers(void)
 
 		TAILQ_INIT(&worker->ns_ctx);
 		worker->lcore = i;
+        // 添加 worker_id
+        worker->worker_id = g_num_workers;
 		TAILQ_INSERT_TAIL(&g_workers, worker, link);
 		g_num_workers++;
 	}
@@ -3092,6 +3304,10 @@ allocate_ns_worker(struct ns_entry *entry, struct worker_thread *worker)
 	ns_ctx->stats.min_tsc = UINT64_MAX;
 	ns_ctx->entry = entry;
 	ns_ctx->histogram = spdk_histogram_data_alloc();
+
+    // ns_ctx worker_id 关联
+    ns_ctx->worker_id = worker->worker_id;
+
 	TAILQ_INSERT_TAIL(&worker->ns_ctx, ns_ctx, link);
 
 	return 0;
@@ -3310,7 +3526,7 @@ main(int argc, char **argv)
 	main_worker = NULL;
 	TAILQ_FOREACH(worker, &g_workers, link) {
 		if (worker->lcore != g_main_core) {
-			spdk_env_thread_launch_pinned(worker->lcore, work_fn, worker);
+            spdk_env_thread_launch_pinned(worker->lcore, work_fn, worker);
 		} else {
 			assert(main_worker == NULL);
 			main_worker = worker;
@@ -3318,11 +3534,15 @@ main(int argc, char **argv)
 	}
 
 	assert(main_worker != NULL);
-	work_fn(main_worker);
-
-	spdk_env_thread_wait_all();
+    work_fn(main_worker);
+    
+    spdk_env_thread_wait_all();
 
 	print_stats();
+
+    // 打印 Total Time
+    double time_diff = (end_time.tv_sec - start_time.tv_sec) * 1e9 + (end_time.tv_nsec - start_time.tv_nsec);
+    printf("Total Time(ns): %lf\n", time_diff);
 
 	pthread_barrier_destroy(&g_worker_sync_barrier);
 
