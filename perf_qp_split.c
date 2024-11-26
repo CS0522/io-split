@@ -962,13 +962,14 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
     }
 
     // myprint
-    printf("g_split_io_strategy = %d\n", g_split_io_strategy);
-    printf("qp_num = %d, task->is_read = %d, task->task_io_size_bytes = %u, task->iovs[0].iov_len = %ld\n", qp_num, task->is_read, task->task_io_size_bytes, task->iovs[0].iov_len);
+    // printf("g_split_io_strategy = %d\n", g_split_io_strategy);
+    // printf("qp_num = %d, task->is_read = %d, task->task_io_size_bytes = %u, task->iovs[0].iov_len = %ld\n", qp_num, task->is_read, task->task_io_size_bytes, task->iovs[0].iov_len);
 
     // 修改一个 IO 里的块个数
     uint32_t io_size_blocks = entry->io_size_blocks;
-    if (task->task_io_size_bytes == g_io_size_bytes * 64)
-        io_size_blocks *= 64;
+    if (g_split_io_strategy)
+        if (task->task_io_size_bytes == g_io_size_bytes * 64)
+            io_size_blocks *= 64;
 
 	if (mode != DIF_MODE_NONE) {
 		dif_opts.size = SPDK_SIZEOF(&dif_opts, dif_pi_format);
@@ -1458,8 +1459,8 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->u.nvme.ns = ns;
 	entry->num_io_requests = entries * spdk_divide_round_up(g_queue_depth, g_nr_io_queues_per_ns);
 
-    // 空间缩小为 10%
-	entry->size_in_ios = (ns_size / 10) / g_io_size_bytes;
+    // 空间缩小为 5%
+	entry->size_in_ios = (ns_size / 20) / g_io_size_bytes;
 	entry->io_size_blocks = g_io_size_bytes / sector_size;
 
 	if (g_is_random) {
@@ -1807,25 +1808,25 @@ submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
 	struct perf_task *task;
 
     /* 如果 mix 为 0% 的情况 */
-    if (g_io_size_4k_percentage == 0 || g_io_size_4k_percentage == 100 ||
-        g_rw_percentage == 0 || g_rw_percentage == 100)
-    {
-        if (g_split_io_strategy)
-            // 4K 比例为 0，io_submit_flag = 1，全发 256K
-            // 4K 比例为 100，io_submit_flag = 0，全发 4K
-            ns_ctx->io_submit_flag = (g_io_size_4k_percentage == 0);
-        else
-            // r 比例为 0，io_submit_flag = 0，全发 write
-            // r 比例为 100，io_submit_flag = 1，全发 read
-            ns_ctx->io_submit_flag = (g_rw_percentage == 100);
-        while (queue_depth > 0)
-        {
-            task = ns_ctx->allocated_tasks[ns_ctx->io_submit_flag][g_queue_depth - queue_depth];
-            submit_single_io(task);
-            --queue_depth;
-        }
-        return;
-    }
+    // if (g_io_size_4k_percentage == 0 || g_io_size_4k_percentage == 100 ||
+    //     g_rw_percentage == 0 || g_rw_percentage == 100)
+    // {
+    //     if (g_split_io_strategy)
+    //         // 4K 比例为 0，io_submit_flag = 1，全发 256K
+    //         // 4K 比例为 100，io_submit_flag = 0，全发 4K
+    //         ns_ctx->io_submit_flag = (g_io_size_4k_percentage == 0);
+    //     else
+    //         // r 比例为 0，io_submit_flag = 0，全发 write
+    //         // r 比例为 100，io_submit_flag = 1，全发 read
+    //         ns_ctx->io_submit_flag = (g_rw_percentage == 100);
+    //     while (queue_depth > 0)
+    //     {
+    //         task = ns_ctx->allocated_tasks[ns_ctx->io_submit_flag][g_queue_depth - queue_depth];
+    //         submit_single_io(task);
+    //         --queue_depth;
+    //     }
+    //     return;
+    // }
 
     while (queue_depth > 0)
     {
@@ -2360,13 +2361,13 @@ print_performance(void)
 						                g_tsc_rate;
 
                 // myprint
-                printf("ns_ctx->stats.io_submitted: %lu\n", ns_ctx->stats.io_submitted);
-                printf("ns_ctx->stats.io_completed: %lu\n", ns_ctx->stats.io_completed);
-                printf("ns_ctx->stats.total_tsc: %lu\n", ns_ctx->stats.total_tsc);
-                printf("ns_ctx->io_submitted_counter: %u, %u\n", ns_ctx->io_submitted_counter[0], ns_ctx->io_submitted_counter[1]);
-                printf("ns_ctx->io_total_tsc: %lu, %lu\n", ns_ctx->io_total_tsc[0], ns_ctx->io_total_tsc[1]);
-                printf("g_tsc_rate: %lu\n", g_tsc_rate);
-                printf("g_io_avg_latency: %f, %f\n", g_io_avg_latency[0], g_io_avg_latency[1]);
+                // printf("ns_ctx->stats.io_submitted: %lu\n", ns_ctx->stats.io_submitted);
+                // printf("ns_ctx->stats.io_completed: %lu\n", ns_ctx->stats.io_completed);
+                // printf("ns_ctx->stats.total_tsc: %lu\n", ns_ctx->stats.total_tsc);
+                // printf("ns_ctx->io_submitted_counter: %u, %u\n", ns_ctx->io_submitted_counter[0], ns_ctx->io_submitted_counter[1]);
+                // printf("ns_ctx->io_total_tsc: %lu, %lu\n", ns_ctx->io_total_tsc[0], ns_ctx->io_total_tsc[1]);
+                // printf("g_tsc_rate: %lu\n", g_tsc_rate);
+                // printf("g_io_avg_latency: %f, %f\n", g_io_avg_latency[0], g_io_avg_latency[1]);
 
 				min_latency = (double)ns_ctx->stats.min_tsc * 1000 * 1000 / g_tsc_rate;
 				if (min_latency < min_latency_so_far) {

@@ -954,7 +954,17 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 		DIF_MODE_DIX = 2,
 	}  mode = DIF_MODE_NONE;
 
+    // 计算起始地址：随机得到的偏移 io 个数 * 每个 io 占 n 个块
+    // 这里应该不用修改
 	lba = offset_in_ios * entry->io_size_blocks;
+
+    uint32_t io_size_blocks = entry->io_size_blocks;
+    // 如果大小为 256K
+    if (g_split_io_strategy)
+    {
+        if (task->task_io_size_bytes == g_io_size_bytes * SIZE_MULTI)
+            io_size_blocks *= SIZE_MULTI;
+    }
 
 	if (entry->md_size != 0 && !(entry->io_flags & SPDK_NVME_IO_FLAGS_PRACT)) {
 		if (entry->md_interleave) {
@@ -997,12 +1007,12 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			return spdk_nvme_ns_cmd_read_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
 							     task->iovs[0].iov_base, task->md_iov.iov_base,
 							     lba,
-							     entry->io_size_blocks, io_complete,
+							     io_size_blocks, io_complete,
 							     task, entry->io_flags,
 							     task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
 		} else {
 			return spdk_nvme_ns_cmd_readv_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
-							      lba, entry->io_size_blocks,
+							      lba, io_size_blocks,
 							      io_complete, task, entry->io_flags,
 							      nvme_perf_reset_sgl, nvme_perf_next_sge,
 							      task->md_iov.iov_base,
@@ -1033,12 +1043,12 @@ nvme_submit_io(struct perf_task *task, struct ns_worker_ctx *ns_ctx,
 			return spdk_nvme_ns_cmd_write_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
 							      task->iovs[0].iov_base, task->md_iov.iov_base,
 							      lba,
-							      entry->io_size_blocks, io_complete,
+							      io_size_blocks, io_complete,
 							      task, entry->io_flags,
 							      task->dif_ctx.apptag_mask, task->dif_ctx.app_tag);
 		} else {
 			return spdk_nvme_ns_cmd_writev_with_md(entry->u.nvme.ns, ns_ctx->u.nvme.qpair[qp_num],
-							       lba, entry->io_size_blocks,
+							       lba, io_size_blocks,
 							       io_complete, task, entry->io_flags,
 							       nvme_perf_reset_sgl, nvme_perf_next_sge,
 							       task->md_iov.iov_base,
@@ -1467,8 +1477,8 @@ register_ns(struct spdk_nvme_ctrlr *ctrlr, struct spdk_nvme_ns *ns)
 	entry->u.nvme.ns = ns;
 	entry->num_io_requests = entries * spdk_divide_round_up(g_queue_depth, g_nr_io_queues_per_ns);
 
-    // 空间缩小为 10%
-	entry->size_in_ios = (ns_size / 10) / g_io_size_bytes;
+    // 空间缩小为 5%
+	entry->size_in_ios = (ns_size / 20) / g_io_size_bytes;
 	entry->io_size_blocks = g_io_size_bytes / sector_size;
 
 	if (g_is_random) {
@@ -1718,7 +1728,7 @@ submit_single_io(struct perf_task *task)
 }
 
 static void
-submit_io_specific_type(struct ns_worker_ctx*, int, int);
+submit_io_specific_type(struct ns_worker_ctx*, int, int, int);
 
 static inline void
 task_complete(struct perf_task *task)
@@ -1774,7 +1784,7 @@ task_complete(struct perf_task *task)
         if (g_enable_split_io)
         {
             /** 
-             * 最后一个 4k 发完，在这次回调中一次发送 2n 个 256K，
+             * 某个 4K 完成回调判断 submit 达标，在这次回调中一次发送 2n 个 256K，
              * 后续 4K 完成回调不再发送
              */
             // 如果当前的 worker 还没有发送过另一个 IO 类型
@@ -1787,7 +1797,7 @@ task_complete(struct perf_task *task)
                 if (__sync_add_and_fetch(&g_io_submitted_counter[!counter_index], 0) < g_io_max_submit_num[!counter_index])
                 {
                     // 一次发送 2n 个指定另一种类型 IO
-                    submit_io_specific_type(ns_ctx, g_queue_depth * 2, !counter_index);
+                    submit_io_specific_type(ns_ctx, g_queue_depth * 2, !counter_index, 0);
                     // 发送完 return
                 }
             }
@@ -1801,10 +1811,34 @@ task_complete(struct perf_task *task)
         else
         {
             /** 
-             * 最后一个 4k 发完，在这次回调中一次发送 n 个 256K，
+             * 某个 4K 完成回调判断 submit 达标，在这次回调中一次发送 n 个 256K，
              * 后续 4K 完成回调不再发送
              */
-            // TODO 是否需要发送另一个类型 IO？
+            if (!ns_ctx->has_submitted_the_other_type)
+            {
+                // 打上发送过另一个 IO 类型标记
+                ns_ctx->has_submitted_the_other_type = 1;
+
+                // 检查另一种类型的 IO 是否发送完毕
+                if (__sync_add_and_fetch(&g_io_submitted_counter[!counter_index], 0) < g_io_max_submit_num[!counter_index])
+                {
+                    // 一次发送 n 个指定另一种类型 IO
+                    /**
+                     * 这里参数的含义
+                     * 第一个 g_queue_depth 表示发送 g_queue_depth 个；
+                     * 第二个 g_queue_depth 表示从已分配数组中第 g_queue_depth 下标的 task 开始，
+                     * 因为在关闭分流下，allocated_tasks 中 4K 和 256K 的前 g_queue_depth 已经发送出去，
+                     * 再发送时不能重复发送。所以在分配时就全部分配好 2n 个，
+                     * 在关闭分流的情况下直接从 n 开始往后取没发送的发送。
+                     */
+                    submit_io_specific_type(ns_ctx, g_queue_depth, !counter_index, g_queue_depth);
+                    // 发送完 return
+                }
+            }
+            /**
+             * 当前 worker 已经发送过另一个 IO 类型
+             * 或另一个也发送完毕则返回
+             */
             return;
         }
     }
@@ -1884,12 +1918,12 @@ allocate_task(struct ns_worker_ctx *ns_ctx, int queue_depth)
  * 发送指定类型的 IO
  */
 static void
-submit_io_specific_type(struct ns_worker_ctx *ns_ctx, int submit_num, int io_type_index)
+submit_io_specific_type(struct ns_worker_ctx *ns_ctx, int submit_num, int io_type_index, int start_index)
 {
     struct perf_task *task;
     while (submit_num-- > 0)
     {
-        task = ns_ctx->allocated_tasks[io_type_index][submit_num];
+        task = ns_ctx->allocated_tasks[io_type_index][(submit_num + start_index) % (MAX_QUEUE_DEPTH * 2)];
         submit_single_io(task);
     }
 }
@@ -1902,7 +1936,7 @@ submit_io(struct ns_worker_ctx *ns_ctx, int queue_depth)
      * 开启分流，单个 worker 首先只下某种类型的 IO
      */
     if (g_enable_split_io)
-        submit_io_specific_type(ns_ctx, queue_depth * 2, ns_ctx->worker_id);
+        submit_io_specific_type(ns_ctx, queue_depth * 2, ns_ctx->worker_id, 0);
     /**
      * 关闭分流，交叉下两种类型 IO
      * 两个 worker 下的 IO 类型顺序相同，都是先下 4K 或 write
@@ -1956,23 +1990,23 @@ init_ns_worker_ctx_ext(struct ns_worker_ctx *ns_ctx)
     ns_ctx->io_allocated_counter[0] = allocated_counter;
     ns_ctx->io_allocated_counter[1] = allocated_counter;
 
-    // 每个 ns_ctx 预分配一定数目的两种类型 IO
+    // 每个 ns_ctx 把预分配数组分配满
     int i = 0;
-    // 4K: 0; 256K: 1
+    // 4K, write: 0; 256K, read: 1
     ns_ctx->io_allocate_flag = 0;
-    while (i < ns_ctx->io_allocated_counter[ns_ctx->io_allocate_flag])
+    while (i < MAX_QUEUE_DEPTH * 2)
     {   
         // 在 allocate task 中根据当前的 io_allocate_flag 分配大小
-        ns_ctx->allocated_tasks[ns_ctx->io_allocate_flag][i % allocated_counter] = allocate_task(ns_ctx, allocated_counter - 1 - i);
+        ns_ctx->allocated_tasks[ns_ctx->io_allocate_flag][i] = allocate_task(ns_ctx, i);
         // 如果是读写分流
         if (!g_split_io_strategy)
-            ns_ctx->allocated_tasks[ns_ctx->io_allocate_flag][i % allocated_counter]->is_read = ns_ctx->io_allocate_flag;
+            ns_ctx->allocated_tasks[ns_ctx->io_allocate_flag][i]->is_read = ns_ctx->io_allocate_flag;
 
         ++i;
         // 某种类型的分配数目够了，换另一种类型分配
         // 如果 flag = 1，意味着已经换过了，if 条件不会再进入
         if (!ns_ctx->io_allocate_flag && 
-            (i == ns_ctx->io_allocated_counter[ns_ctx->io_allocate_flag]))
+            (i == MAX_QUEUE_DEPTH * 2))
         {
             i = 0;
             // flag 反转，开始分配 256K 或 read
